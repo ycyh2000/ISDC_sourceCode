@@ -27,20 +27,31 @@ The framework further introduces a GPU-oriented decompression pipeline that enab
 ---
 
 ## Framework
+## Framework
+
+ISDC consists of a compression stage and a GPU-oriented decompression stage.
+
+### Compression
+
 <p align="center">
 <img src="figures/ISDC_compression.png" width="800">
 </p>
+
+The compression stage exploits sparsity-induced index information to transform high-entropy mantissa streams into compact differential representations. Specifically, ISDC:
+
+1. Extracts non-zero values from N:M sparse matrices.
+2. Reorders values according to sparse index information.
+3. Applies differential encoding within each sparse group.
+4. Compresses residuals using a shared bit-width representation.
+
+### Decompression
+
 <p align="center">
 <img src="figures/ISDC_decompression.png" width="800">
 </p>
 
-The overall workflow consists of:
+The decompression stage leverages massively parallel GPU kernels to reconstruct sparse weights directly from compressed bitstreams, enabling efficient sparse model deployment while preserving exact numerical accuracy.
 
-1. Extract non-zero weights from N:M sparse matrices.
-2. Reorder values according to sparse index information.
-3. Apply differential encoding within each sparse group.
-4. Encode residuals using shared bit-width representation.
-5. Reconstruct sparse weights using massively parallel GPU decompression.
 
 ---
 
