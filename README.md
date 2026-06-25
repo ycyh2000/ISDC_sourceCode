@@ -91,7 +91,7 @@ ISDC/
 ├── requirements.txt
 ├── LICENSE
 └── README.md
-
+```
 
 
 ## Installation
@@ -101,7 +101,7 @@ ISDC/
 ```bash
 conda create -n ISDC python=3.11
 conda activate ISDC
-```
+
 
 ### 2. Install PyTorch
 
