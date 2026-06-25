@@ -91,3 +91,60 @@ ISDC/
 ├── requirements.txt
 ├── LICENSE
 └── README.md
+
+
+
+## Installation
+
+### 1. Create a Conda Environment
+
+```bash
+conda create -n ISDC python=3.11
+conda activate ISDC
+```
+
+### 2. Install PyTorch
+
+For CUDA 11.8:
+
+```bash
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
+    --index-url https://download.pytorch.org/whl/cu118
+```
+
+### 3. Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Verify Installation
+
+```bash
+python -c "import torch; print(torch.__version__)"
+```
+
+Expected output:
+
+```text
+2.7.1
+```
+
+---
+
+## System Requirements
+
+* Ubuntu 22.04 / 24.04
+* Python >= 3.10
+* CUDA >= 11.8
+* NVIDIA GPU (recommended)
+
+The experiments in the paper were conducted on:
+
+* CPU: Intel Xeon Platinum 8380
+* GPU: NVIDIA RTX A6000
+* CUDA: 12.0
+* PyTorch: 2.7.1
+
+```
+```
