@@ -1,0 +1,655 @@
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include <stdio.h>
+#include <math.h>
+#include <stdint.h>
+#include <cub/cub.cuh>
+//#include <torch/torch.h>   //  #include <ATen/ATen.h>
+
+#define DTYPE "bfloat16"
+
+#define M_GLOBAL 1
+#define K_GLOBAL 1024
+#define K_GLOBAL_SPARSE 512
+#define N_GLOBAL 1024
+
+#define N 4
+#define N_SHIFT 2
+#define M 8
+#define INDEX_REPRESENT_WIDTH 3
+
+
+
+#define BLOCK_SIZE_M 32
+#define BLOCK_SIZE_N 32
+#define BLOCK_SIZE_K BLOCK_SIZE_N
+#define BLOCK_SIZE_K_SPARSE (BLOCK_SIZE_N / 2)
+
+#define THREAD_SIZE_M 32
+#define THREAD_SIZE_N 1
+
+#define PROCESSLINE 1
+#define BLOCKSIZE_ 32
+
+#define MANT_HEAD_DATA_WIDTH 7
+#define MANT_DECOMPRESS_NUM_PER 4 //This value is a fixed constant equal to 4.
+#define MANT_DECOMPRESS_NUM_PER_SHIFT 2 //Shift right by this number of bits to divide by MANT_DECOMPRESS_NUM_PER (since 4 = 2^2)
+
+// REGNUM must be configured such that (REGNUM + 1) * 32 equals a power of two.
+#define INDEX_REGNUM 3
+#define WIDTH_REGNUM 3
+#define MANT_REGNUM 7
+
+#define INDEX_MEMORYSIZE (INDEX_REGNUM) * 32 * 32
+#define WIDTH_MEMORYSIZE (WIDTH_REGNUM) * 32 * 32
+#define MANT_MEMORYSIZE (MANT_REGNUM) * 32 * 32
+
+const uint32_t INDEX_MEMORY_MASK = ((INDEX_REGNUM + 1) * 32) - 1;
+const uint32_t WIDTH_MEMORY_MASK = ((WIDTH_REGNUM + 1) * 32) - 1;
+const uint32_t MANT_MEMORY_MASK = ((MANT_REGNUM + 1) * 32) - 1;
+
+
+#define REGNUM 3
+#define MEMORYSIZE (REGNUM) * 32 * 32
+#define GROUPNUM 1  //Process a batch of data, referring to the N elements in N:M sparse compression.
+
+const uint32_t MEMORY_MASK = ((REGNUM + 1) * 32) - 1;
+
+
+#define CUDA_CHECK(call) { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        printf("CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+}
+
+__global__ void decompress_kernel(
+    uint32_t* compressed_data_width, int compressed_data_width_size,
+    uint32_t* compressed_weight_data, int compressed_weight_data_size,
+    uint8_t* index_data, int index_data_size,
+
+    bool* sign_data, int sign_data_size,
+    uint8_t* exp_data, int exp_data_size,
+
+    uint32_t* mantDataStartAddr,
+    int data_width_len,
+    int base_width,
+
+//    uint32_t* decompressed_index_gpu,
+    uint16_t* decompressed_weight_gpu
+)
+{
+
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int data_width_len_reg = data_width_len;
+
+
+    __shared__ uint32_t MemoryMessage[32];
+    MemoryMessage[tid] = 0;
+
+//    uint8_t index0,index1,index2,index3;
+
+
+    uint32_t dataWidthBaseAddr = bid * PROCESSLINE * (K_GLOBAL_SPARSE / N) * data_width_len_reg;
+    __shared__ uint32_t dataWidthMemory[(WIDTH_REGNUM + 1) * 32];
+    uint32_t currentDataWidthSharedWriteAddr = tid * 32;
+    uint32_t currentDataWidthSharedReadAddr = tid * GROUPNUM * data_width_len_reg;
+    uint32_t dataWidthSharedWriteAddr = 0;  //MemoryMessage[4]
+    uint32_t dataWidthSharedReadAddr = 0;   //MemoryMessage[5]
+    float dataWidthReadLoop = (PROCESSLINE * (K_GLOBAL_SPARSE / N) * data_width_len_reg) / (32 * 32);
+
+
+    uint32_t mantDataBaseAddr = mantDataStartAddr[bid * PROCESSLINE];
+    uint32_t mantDataEndAddr = mantDataStartAddr[bid * PROCESSLINE + 1];
+    __shared__ uint32_t mantDataMemory[(MANT_REGNUM + 1) * 32];
+    uint32_t currentDataSharedWriteAddr = tid * 32;
+    uint32_t currentDataSharedReadAddr = mantDataBaseAddr % 32;
+    uint32_t dataSharedWriteAddr = 0;   //MemoryMessage[8]
+    uint32_t dataSharedReadAddr = 0;    //MemoryMessage[9]
+    uint32_t dataRegEmpty = MANT_REGNUM * 32 * 32 - (dataSharedWriteAddr - dataSharedReadAddr);
+    float dataReadLoop = (mantDataEndAddr - mantDataBaseAddr) / (32 * 32);
+    uint32_t dataDecompressedRound = 0;
+
+
+    uint32_t startAddr;
+    uint32_t endAddr;
+    uint32_t endWordAddr;
+    uint32_t startWordAddr;
+    uint32_t endBitOffset;
+    uint32_t endWord;
+    uint32_t startWord;
+
+
+    __shared__ uint32_t scan_width[7][64];  // 6 layers, 64 elements per layer
+    __shared__ uint32_t scan_mant[6][64];
+    uint32_t flag = 0;  //The first bit indicates index read done, the second bit indicates data width read done, the third bit indicates data read done.
+
+
+
+    for (int i = 0; i < (((K_GLOBAL * PROCESSLINE) / M) + 31) >> 5; i++)
+    {
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS DATA WIDTH~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS DATA WIDTH~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS DATA WIDTH~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS DATA WIDTH~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS DATA WIDTH~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //read data width
+        if ((dataWidthReadLoop >= 0) && (WIDTH_MEMORYSIZE - (dataWidthSharedWriteAddr - dataWidthSharedReadAddr) >= 32 * 32)) {
+            dataWidthMemory[(currentDataWidthSharedWriteAddr >> 5) & WIDTH_MEMORY_MASK] = compressed_data_width[(dataWidthBaseAddr + currentDataWidthSharedWriteAddr) >> 5];
+
+            dataWidthSharedWriteAddr = 32 * 32 + dataWidthSharedWriteAddr;
+
+            currentDataWidthSharedWriteAddr = currentDataWidthSharedWriteAddr + 32 * 32;
+            if (currentDataWidthSharedWriteAddr >= (((K_GLOBAL_SPARSE / N) * data_width_len_reg * PROCESSLINE + 31) & ~31) - 32) {
+                currentDataWidthSharedWriteAddr = (((K_GLOBAL_SPARSE / N) * data_width_len_reg * PROCESSLINE + 31) & ~31) - 32;
+            }
+            dataWidthReadLoop = dataWidthReadLoop - 1;
+        }
+        //******************************
+        //read data width from global memory and concat
+        //******************************
+        startAddr = currentDataWidthSharedReadAddr;
+        endAddr = (currentDataWidthSharedReadAddr + GROUPNUM * data_width_len_reg - 1);
+        endWordAddr = (endAddr >> 5) & WIDTH_MEMORY_MASK;
+        startWordAddr = (startAddr >> 5) & WIDTH_MEMORY_MASK;
+        endBitOffset = endAddr & 0x1F;
+        //read data
+        endWord = dataWidthMemory[endWordAddr];
+        startWord = dataWidthMemory[startWordAddr];
+        // concat
+        uint32_t temp_data_concat = (endWord >> (31 - endBitOffset)) | (startWord << (endBitOffset + 1));
+        uint32_t temp_width = temp_data_concat & ((uint64_t)((1U << data_width_len_reg) - 1));
+        temp_width = temp_width + base_width;
+
+        //1.calculate data len
+        scan_width[0][tid] = 0;
+        scan_width[1][tid] = 0;
+        scan_width[2][tid] = 0;
+        scan_width[3][tid] = 0;
+        scan_width[4][tid] = 0;
+        scan_width[5][tid] = 0;
+
+        // Store input value and initialize temp0
+        scan_width[0][32 + tid] = (temp_width * (N - 1) + MANT_HEAD_DATA_WIDTH);
+        int temp0 = (temp_width * (N - 1) + MANT_HEAD_DATA_WIDTH);
+
+        // Layer 1: Stride 1 accumulation
+        int temp1 = scan_width[0][32 + tid - 1];
+        temp0 = temp0 + temp1;
+        scan_width[1][32 + tid] = temp0;
+
+        // Layer 2: Stride 2 accumulation
+        temp1 = scan_width[1][32 + tid - 2];
+        temp0 = temp0 + temp1;
+        scan_width[2][32 + tid] = temp0;
+
+        // Layer 3: Stride 4 accumulation
+        temp1 = scan_width[2][32 + tid - 4];
+        temp0 = temp0 + temp1;
+        scan_width[3][32 + tid] = temp0;
+
+        // Layer 4: Stride 8 accumulation
+        temp1 = scan_width[3][32 + tid - 8];
+        temp0 = temp0 + temp1;
+        scan_width[4][32 + tid] = temp0;
+
+        // Layer 5: Stride 16 accumulation
+        temp1 = scan_width[4][32 + tid - 16];
+        temp0 = temp0 + temp1;
+        scan_width[5][32 + tid] = temp0;
+
+        //Layer 6: Residual Width for each N:M group
+        scan_width[6][32 + tid] = temp_width;
+
+
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS INDEX ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS INDEX ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS INDEX ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS INDEX ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS INDEX ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        uint32_t* index_data_u32 = reinterpret_cast<uint32_t*>(index_data);
+        uint32_t indexMemory = index_data_u32[
+            bid * (K_GLOBAL_SPARSE / 4) + i * 32 + tid
+        ];
+        uint8_t packedIndexx = (indexMemory >> 0)  & 0xFF;
+        uint8_t packedIndexy = (indexMemory >> 8)  & 0xFF;
+        uint8_t packedIndexz = (indexMemory >> 16) & 0xFF;
+        uint8_t packedIndexw = (indexMemory >> 24) & 0xFF;
+
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS EXP ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS EXP ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS EXP ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS EXP ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS EXP ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//        uint32_t* exp_data_u32 = reinterpret_cast<uint32_t*>(exp_data);
+//        uint32_t expMemory = exp_data_u32[
+//            bid * (K_GLOBAL_SPARSE / 4) + i * 32 + tid
+//        ];
+//        uint8_t packedExpx = (expMemory >> 0)  & 0xFF;
+//        uint8_t packedExpy = (expMemory >> 8)  & 0xFF;
+//        uint8_t packedExpz = (expMemory >> 16) & 0xFF;
+//        uint8_t packedExpw = (expMemory >> 24) & 0xFF;
+
+        uint8_t packedExpx = exp_data[bid * (K_GLOBAL_SPARSE) + i * 32 * 4 + tid * 4 + 0];
+        uint8_t packedExpy = exp_data[bid * (K_GLOBAL_SPARSE) + i * 32 * 4 + tid * 4 + 1];
+        uint8_t packedExpz = exp_data[bid * (K_GLOBAL_SPARSE) + i * 32 * 4 + tid * 4 + 2];
+        uint8_t packedExpw = exp_data[bid * (K_GLOBAL_SPARSE) + i * 32 * 4 + tid * 4 + 3];
+
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS SIGN ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS SIGN ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS SIGN ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS SIGN ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS SIGN ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//        uint32_t* sign_data_u32 = reinterpret_cast<uint32_t*>(sign_data);
+//        uint32_t signMemory = sign_data_u32[
+//            bid * (K_GLOBAL_SPARSE / 4) + i * 32 + tid
+//        ];
+//        bool packedSignx = (signMemory >> (((tid + 1) % 2) * 4 + 0))  & 0x1;
+//        bool packedSigny = (signMemory >> (((tid + 1) % 2) * 4 + 1))  & 0x1;
+//        bool packedSignz = (signMemory >> (((tid + 1) % 2) * 4 + 2))  & 0x1;
+//        bool packedSignw = (signMemory >> (((tid + 1) % 2) * 4 + 3))  & 0x1;
+        bool packedSignx = sign_data[bid * (K_GLOBAL_SPARSE) + i * 32 * 4 + tid * 4 + 0];
+        bool packedSigny = sign_data[bid * (K_GLOBAL_SPARSE) + i * 32 * 4 + tid * 4 + 1];
+        bool packedSignz = sign_data[bid * (K_GLOBAL_SPARSE) + i * 32 * 4 + tid * 4 + 2];
+        bool packedSignw = sign_data[bid * (K_GLOBAL_SPARSE) + i * 32 * 4 + tid * 4 + 3];
+
+
+
+
+
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS MANT ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS MANT ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS MANT ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS MANT ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PROCESS MANT ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        //read mant data
+        if ((dataReadLoop >= 0) && (dataRegEmpty >= 32 * 32)) {
+            mantDataMemory[(currentDataSharedWriteAddr >> 5) & MANT_MEMORY_MASK] = compressed_weight_data[(mantDataBaseAddr + currentDataSharedWriteAddr) >> 5];
+            dataSharedWriteAddr = 32 * 32 + dataSharedWriteAddr;
+//            if((bid == 0)){
+//                printf("bid = %d, tid = %d, dataSharedWriteAddr = %u\n",bid, tid, dataSharedWriteAddr);
+//            }
+//            if(bid == 0){
+//                printf("tid = %d, currentDataSharedWriteAddr = %u mantDataMemory[(currentDataSharedWriteAddr >> 5) & MANT_MEMORY_MASK] = %u\n",tid, currentDataSharedWriteAddr, mantDataMemory[(currentDataSharedWriteAddr >> 5) & MANT_MEMORY_MASK]);
+//            }
+
+            currentDataSharedWriteAddr = currentDataSharedWriteAddr + 32 * 32;
+            if (currentDataSharedWriteAddr >= mantDataEndAddr) {
+                currentDataSharedWriteAddr = mantDataEndAddr - 1;
+            }
+            dataRegEmpty = MANT_REGNUM * 32 * 32 - (dataSharedWriteAddr - dataSharedReadAddr);
+
+
+            dataReadLoop = dataReadLoop - 1;
+        }
+
+        //******************************
+        //read data from global memory and concat
+        //******************************
+        // ~~~~~~~~~~~~~~~~~~~~~~~~ original version ~~~~~~~~~~~~~~~~~~~~~~~~
+        // ~~~~~~~~~~~~~~~~~~~~~~~~ original version ~~~~~~~~~~~~~~~~~~~~~~~~
+        // ~~~~~~~~~~~~~~~~~~~~~~~~ original version ~~~~~~~~~~~~~~~~~~~~~~~~
+        // ~~~~~~~~~~~~~~~~~~~~~~~~ original version ~~~~~~~~~~~~~~~~~~~~~~~~
+        // ~~~~~~~~~~~~~~~~~~~~~~~~ original version ~~~~~~~~~~~~~~~~~~~~~~~~
+
+        uint32_t packedDatax, packedDatay, packedDataz, packedDataw;
+        uint32_t currentMantGroupAddr = scan_width[5][32 + ((tid << MANT_DECOMPRESS_NUM_PER_SHIFT) >> N_SHIFT)];
+        uint32_t allMantGroupAddr = scan_width[5][32 + ((31 << MANT_DECOMPRESS_NUM_PER_SHIFT) >> N_SHIFT)];
+        uint32_t currentGroupResidualWidth = scan_width[6][32 + ((tid << MANT_DECOMPRESS_NUM_PER_SHIFT) >> N_SHIFT)];
+        uint32_t backID = (N / MANT_DECOMPRESS_NUM_PER) - (tid % (N / MANT_DECOMPRESS_NUM_PER)) - 1;
+        currentDataSharedReadAddr = currentDataSharedReadAddr + currentMantGroupAddr;
+
+        endAddr = (currentDataSharedReadAddr - 1 - backID * MANT_DECOMPRESS_NUM_PER * currentGroupResidualWidth);
+        startAddr = endAddr - 32;
+
+        dataSharedReadAddr = currentDataSharedReadAddr - currentMantGroupAddr + allMantGroupAddr;
+
+        endWordAddr = (endAddr >> 5) & MANT_MEMORY_MASK;
+        startWordAddr = (startAddr >> 5) & MANT_MEMORY_MASK;
+        endBitOffset = endAddr & 0x1F;
+        //read data
+        endWord = mantDataMemory[endWordAddr];
+        startWord = mantDataMemory[startWordAddr];
+        // concat
+        uint64_t mant_data_concat = (endWord >> (31 - endBitOffset)) | (startWord << (endBitOffset + 1));
+        packedDataw = mant_data_concat & ((1U << currentGroupResidualWidth) - 1);
+        mant_data_concat = (mant_data_concat >> currentGroupResidualWidth);
+        packedDataz = mant_data_concat & ((1U << currentGroupResidualWidth) - 1);
+        mant_data_concat = (mant_data_concat >> currentGroupResidualWidth);
+        packedDatay = mant_data_concat & ((1U << currentGroupResidualWidth) - 1);
+        mant_data_concat = (mant_data_concat >> currentGroupResidualWidth);
+        if ((tid % (N / MANT_DECOMPRESS_NUM_PER)) == 0) {
+            packedDatax = mant_data_concat & ((1U << MANT_HEAD_DATA_WIDTH) - 1);
+        }
+        else {
+            packedDatax = mant_data_concat & ((1U << currentGroupResidualWidth) - 1);
+        }
+        packedDatay = packedDatay + packedDatax;
+        packedDataz = packedDataz + packedDatay;
+        packedDataw = packedDataw + packedDataz;
+
+//        if(bid == 0){
+//            printf("tid = %d, packedDatax = %u, packedDatay = %u, packedDataz = %u, packedDataw = %u dataSharedWriteAddr = %u, dataSharedReadAddr = %u, endAddr = %u, startAddr = %u, endWord = %u, startWord = %u\n",tid, packedDatax, packedDatay, packedDataz, packedDataw, dataSharedWriteAddr, dataSharedReadAddr, endAddr, startAddr, endWord, startWord);
+//        }
+
+        currentDataSharedReadAddr = dataSharedReadAddr;
+        dataRegEmpty = MANT_REGNUM * 32 * 32 - (dataSharedWriteAddr - dataSharedReadAddr);
+
+
+        (decompressed_weight_gpu)[(K_GLOBAL * bid * PROCESSLINE + dataDecompressedRound * 32 * GROUPNUM * M + tid * M) + packedIndexx] = ((uint16_t)packedSignx << 15) | ((uint32_t)packedExpx << 7) | (packedDatax & 0x7F);
+        (decompressed_weight_gpu)[(K_GLOBAL * bid * PROCESSLINE + dataDecompressedRound * 32 * GROUPNUM * M + tid * M) + packedIndexy] = ((uint16_t)packedSigny << 15) | ((uint32_t)packedExpy << 7) | (packedDatay & 0x7F);
+        (decompressed_weight_gpu)[(K_GLOBAL * bid * PROCESSLINE + dataDecompressedRound * 32 * GROUPNUM * M + tid * M) + packedIndexz] = ((uint16_t)packedSignz << 15) | ((uint32_t)packedExpz << 7) | (packedDataz & 0x7F);
+        (decompressed_weight_gpu)[(K_GLOBAL * bid * PROCESSLINE + dataDecompressedRound * 32 * GROUPNUM * M + tid * M) + packedIndexw] = ((uint16_t)packedSignw << 15) | ((uint32_t)packedExpw << 7) | (packedDataw & 0x7F);
+        dataDecompressedRound++;
+
+
+        dataWidthSharedReadAddr = dataWidthSharedReadAddr + 32 * GROUPNUM * data_width_len_reg;
+        currentDataWidthSharedReadAddr = currentDataWidthSharedReadAddr + 32 * GROUPNUM * data_width_len_reg;
+
+    }
+
+}
+
+extern "C" {
+// ------------------------------------------------------------------
+// Version 1: Data already on GPU (all input pointers are device pointers)
+// ------------------------------------------------------------------
+void call_decompress_kernel_device(
+    uint32_t* d_compressed_data_width, int compressed_data_width_size,
+    uint32_t* d_compressed_weight_data, int compressed_weight_data_size,
+    uint8_t* d_index_data, int index_data_size,
+    uint8_t* d_exp_data, int exp_data_size,
+    bool* d_sign_data, int sign_data_size,
+    uint32_t* d_startAddr,
+    int oc_size, int ic_size,
+    int data_width_len,
+    int base_width,
+    float* runtime_,
+    uint16_t* d_decompressed_weight   // output device buffer
+) {
+
+
+    const int h = N_GLOBAL;
+    const int vecNum = K_GLOBAL;
+    int w = int(vecNum / M) * N;
+    const int minibatch = M_GLOBAL;
+
+    int dev = 3;
+    cudaSetDevice(dev);
+
+    // Optional: null pointer check
+    if (d_compressed_data_width == nullptr || d_compressed_weight_data == nullptr ||
+        d_index_data == nullptr || d_exp_data == nullptr || d_sign_data == nullptr ||
+        d_startAddr == nullptr || d_decompressed_weight == nullptr) {
+        printf("Error: one or more device pointers are NULL\n");
+        return;
+    }
+
+//    printf("C received ptr: %p\n", d_compressed_data_width);
+//    printf("Current CUDA device: %d\n", dev);
+//
+//    uint32_t* h_data = (uint32_t*)malloc(compressed_weight_data_size * sizeof(uint32_t));
+//    cudaMemcpy(h_data, d_compressed_weight_data, compressed_weight_data_size * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+//    for(int i = 0; i < 100; i++){
+//        printf("d_compressed_weight_data[%d] = %u\n", i, h_data[i]);
+//    }
+//    free(h_data);
+
+
+    int ntimes = 1;
+    dim3 dimBlock(BLOCKSIZE_);
+    dim3 dimGrid(oc_size / PROCESSLINE);
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
+
+    for (int i = 0; i < ntimes; ++i) {
+        decompress_kernel<<<dimGrid, dimBlock>>>(
+            d_compressed_data_width, compressed_data_width_size,
+            d_compressed_weight_data, compressed_weight_data_size,
+            d_index_data, index_data_size,
+            d_sign_data, sign_data_size,
+            d_exp_data, exp_data_size,
+            d_startAddr,
+            data_width_len,
+            base_width,
+            d_decompressed_weight
+        );
+    }
+
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float elapsed_time;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    *runtime_ = elapsed_time / ntimes;
+//    printf("Kernel runtime (device version) = %lf ms\n", *runtime_);
+
+    cudaError_t kernelError = cudaGetLastError();
+    if (kernelError != cudaSuccess) {
+        printf("Kernel launch failed: %s\n", cudaGetErrorString(kernelError));
+        return;
+    }
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    // Note: do not call cudaDeviceReset()
+}
+
+// ------------------------------------------------------------------
+// Version 2: Data on CPU (automatically allocates GPU memory, copies, and frees)
+// ------------------------------------------------------------------
+void call_decompress_kernel(
+    uint32_t* compressed_data_width, int compressed_data_width_size,
+    uint32_t* compressed_weight_data, int compressed_weight_data_size,
+    uint8_t* index_data, int index_data_size,
+    uint8_t* exp_data, int exp_data_size,
+    bool* sign_data, int sign_data_size,
+    uint32_t* startAddr,
+    int oc_size, int ic_size,
+    int data_width_len,
+    int base_width,
+    float* runtime_,
+    uint16_t* decompressed_weight
+) {
+    const int h = N_GLOBAL;
+    const int vecNum = K_GLOBAL;
+    int w = int(vecNum / M) * N;
+    const int minibatch = M_GLOBAL;
+
+    int dev = 3;
+    cudaSetDevice(dev);
+
+    // Allocate GPU memory
+    uint32_t* d_compressed_data_width;
+    uint32_t* d_compressed_weight_data;
+    uint8_t* d_index_data;
+    bool* d_sign_data;
+    uint8_t* d_exp_data;
+    uint32_t* d_startAddr;
+    uint16_t* d_decompressed_weight;
+
+    CUDA_CHECK(cudaMalloc((void**)&d_compressed_data_width, compressed_data_width_size * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d_compressed_weight_data, compressed_weight_data_size * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d_index_data, index_data_size * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d_sign_data, sign_data_size * sizeof(bool)));
+    CUDA_CHECK(cudaMalloc((void**)&d_exp_data, exp_data_size * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d_startAddr, (N_GLOBAL + 1) * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d_decompressed_weight, N_GLOBAL * K_GLOBAL * sizeof(uint16_t)));
+
+    // Copy data to GPU
+    CUDA_CHECK(cudaMemcpy(d_compressed_data_width, compressed_data_width, compressed_data_width_size * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_compressed_weight_data, compressed_weight_data, compressed_weight_data_size * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_index_data, index_data, index_data_size * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sign_data, sign_data, sign_data_size * sizeof(bool), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_exp_data, exp_data, exp_data_size * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_startAddr, startAddr, (N_GLOBAL + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_decompressed_weight, 0, N_GLOBAL * K_GLOBAL * sizeof(uint16_t)));
+
+    int ntimes = 1;
+    dim3 dimBlock(BLOCKSIZE_);
+    dim3 dimGrid(oc_size / PROCESSLINE);
+
+    // Warm-up (optional)
+    // for (int i = 0; i < ntimes; ++i) { ... }
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
+
+    for (int i = 0; i < ntimes; ++i) {
+        decompress_kernel<<<dimGrid, dimBlock>>>(
+            d_compressed_data_width, compressed_data_width_size,
+            d_compressed_weight_data, compressed_weight_data_size,
+            d_index_data, index_data_size,
+            d_sign_data, sign_data_size,
+            d_exp_data, exp_data_size,
+            d_startAddr,
+            data_width_len,
+            base_width,
+            d_decompressed_weight
+        );
+    }
+
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float elapsed_time;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    *runtime_ = elapsed_time / ntimes;
+//    printf("Kernel runtime (host version) = %lf ms\n", *runtime_);
+
+    cudaError_t kernelError = cudaGetLastError();
+    if (kernelError != cudaSuccess) {
+        printf("Kernel launch failed: %s\n", cudaGetErrorString(kernelError));
+        // Note: free allocated memory even if it fails
+    }
+
+    // Copy result back to host
+    CUDA_CHECK(cudaMemcpy(decompressed_weight, d_decompressed_weight, N_GLOBAL * K_GLOBAL * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+    // Free GPU memory
+    CUDA_CHECK(cudaFree(d_compressed_data_width));
+    CUDA_CHECK(cudaFree(d_compressed_weight_data));
+    CUDA_CHECK(cudaFree(d_index_data));
+    CUDA_CHECK(cudaFree(d_sign_data));
+    CUDA_CHECK(cudaFree(d_exp_data));
+    CUDA_CHECK(cudaFree(d_startAddr));
+    CUDA_CHECK(cudaFree(d_decompressed_weight));
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    // Can keep cudaDeviceReset() or remove it depending on the situation
+}
+
+
+void call_decompress_kernel_toGPU(
+    uint32_t* compressed_data_width, int compressed_data_width_size,
+    uint32_t* compressed_weight_data, int compressed_weight_data_size,
+    uint8_t* index_data, int index_data_size,
+    uint8_t* exp_data, int exp_data_size,
+    bool* sign_data, int sign_data_size,
+    uint32_t* startAddr,
+    int oc_size, int ic_size,
+    int data_width_len,
+    int base_width,
+    float* runtime_,
+    uint16_t* d_decompressed_weight
+) {
+    const int h = N_GLOBAL;
+    const int vecNum = K_GLOBAL;
+    int w = int(vecNum / M) * N;
+    const int minibatch = M_GLOBAL;
+
+    int dev = 3;
+    cudaSetDevice(dev);
+
+    // Allocate GPU memory
+    uint32_t* d_compressed_data_width;
+    uint32_t* d_compressed_weight_data;
+    uint8_t* d_index_data;
+    bool* d_sign_data;
+    uint8_t* d_exp_data;
+    uint32_t* d_startAddr;
+//    uint16_t* d_decompressed_weight;
+
+    CUDA_CHECK(cudaMalloc((void**)&d_compressed_data_width, compressed_data_width_size * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d_compressed_weight_data, compressed_weight_data_size * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d_index_data, index_data_size * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d_sign_data, sign_data_size * sizeof(bool)));
+    CUDA_CHECK(cudaMalloc((void**)&d_exp_data, exp_data_size * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d_startAddr, (N_GLOBAL + 1) * sizeof(uint32_t)));
+//    CUDA_CHECK(cudaMalloc((void**)&d_decompressed_weight, N_GLOBAL * K_GLOBAL * sizeof(uint16_t)));
+
+    // Copy data to GPU
+    CUDA_CHECK(cudaMemcpy(d_compressed_data_width, compressed_data_width, compressed_data_width_size * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_compressed_weight_data, compressed_weight_data, compressed_weight_data_size * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_index_data, index_data, index_data_size * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sign_data, sign_data, sign_data_size * sizeof(bool), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_exp_data, exp_data, exp_data_size * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_startAddr, startAddr, (N_GLOBAL + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+//    CUDA_CHECK(cudaMemset(d_decompressed_weight, 0, N_GLOBAL * K_GLOBAL * sizeof(uint16_t)));
+
+    int ntimes = 1;
+    dim3 dimBlock(BLOCKSIZE_);
+    dim3 dimGrid(oc_size / PROCESSLINE);
+
+    // Warm-up (optional)
+    // for (int i = 0; i < ntimes; ++i) { ... }
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
+
+    for (int i = 0; i < ntimes; ++i) {
+        decompress_kernel<<<dimGrid, dimBlock>>>(
+            d_compressed_data_width, compressed_data_width_size,
+            d_compressed_weight_data, compressed_weight_data_size,
+            d_index_data, index_data_size,
+            d_sign_data, sign_data_size,
+            d_exp_data, exp_data_size,
+            d_startAddr,
+            data_width_len,
+            base_width,
+            d_decompressed_weight
+        );
+    }
+
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float elapsed_time;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    *runtime_ = elapsed_time / ntimes;
+//    printf("Kernel runtime (host version) = %lf ms\n", *runtime_);
+
+    cudaError_t kernelError = cudaGetLastError();
+    if (kernelError != cudaSuccess) {
+        printf("Kernel launch failed: %s\n", cudaGetErrorString(kernelError));
+        // Note: free allocated memory even if it fails
+    }
+
+    // Copy result back to host
+//    CUDA_CHECK(cudaMemcpy(decompressed_weight, d_decompressed_weight, N_GLOBAL * K_GLOBAL * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+    // Free GPU memory
+    CUDA_CHECK(cudaFree(d_compressed_data_width));
+    CUDA_CHECK(cudaFree(d_compressed_weight_data));
+    CUDA_CHECK(cudaFree(d_index_data));
+    CUDA_CHECK(cudaFree(d_sign_data));
+    CUDA_CHECK(cudaFree(d_exp_data));
+    CUDA_CHECK(cudaFree(d_startAddr));
+//    CUDA_CHECK(cudaFree(d_decompressed_weight));
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    // Can keep cudaDeviceReset() or remove it depending on the situation
+}
+
+} // extern "C"
