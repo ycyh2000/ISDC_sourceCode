@@ -1,0 +1,31 @@
+# Core numerical computation
+numpy==1.26.3
+scipy==1.13.1
+pandas==2.3.1
+
+# Deep learning framework
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+
+# CUDA / GPU compression
+cupy-cuda12x==13.6.0
+nvidia-nvcomp-cu12==5.1.0.21
+nvidia-libnvcomp-cu12==5.1.0.21
+
+# Transformer models and datasets
+transformers==4.57.3
+datasets==3.6.0
+accelerate==1.10.1
+safetensors==0.7.0
+sentencepiece==0.2.0
+tokenizers==0.22.1
+huggingface-hub==0.36.0
+sacremoses==0.0.43
+
+# Experiment utilities
+tqdm==4.67.1
+matplotlib==3.9.4
+seaborn==0.13.2
+openpyxl==3.1.5
+PyYAML==6.0.2
