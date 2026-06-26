@@ -12,7 +12,7 @@ from sparsegpt import *
 from modelutils import *
 import matplotlib.pyplot as plt
 import numpy as np
-from ISDC import *
+# from ISDC import *
 
 device = 'cuda:3' if torch.cuda.is_available() else 'cpu'
 print(f"Using device: {device}")
