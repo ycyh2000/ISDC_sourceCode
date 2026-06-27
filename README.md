@@ -147,3 +147,193 @@ The experiments in the paper were conducted on:
 
 ```
 ```
+
+
+## Usage
+
+This section describes how to run ISDC compression and decompression.
+
+---
+
+## 1. Prepare Sparse Weight Files
+
+Before compression, prepare N:M sparse weight matrices in the expected format.
+
+Example directory:
+
+```text
+data/
+├── opt125m_4_8/
+│   ├── model_decoder_layers_0_fc1.json
+│   ├── model_decoder_layers_0_fc2.json
+│   └── ...
+```
+
+Each file should contain the sparse weight values and corresponding sparse index information.
+
+---
+
+## 2. Run ISDC Compression
+
+To compress N:M sparse weights, run:
+
+```bash
+python compressor/compress.py \
+    --input_path data/opt125m_4_8 \
+    --output_path compressed/opt125m_4_8 \
+    --pattern 4:8 \
+    --dtype float16
+```
+
+Arguments:
+
+```text
+--input_path    Path to the input sparse weight files.
+--output_path   Path to save compressed ISDC bitstreams.
+--pattern       N:M sparsity pattern, e.g., 2:4, 4:8, 8:16.
+--dtype         Data type of weights, e.g., float16, bfloat16, float32.
+```
+
+After compression, the output directory will contain:
+
+```text
+compressed/opt125m_4_8/
+├── head_stream/
+├── bitwidth_stream/
+├── residual_stream/
+└── metadata.json
+```
+
+---
+
+## 3. Run ISDC Decompression
+
+To reconstruct weights from compressed ISDC streams, run:
+
+```bash
+python compressor/decompress.py \
+    --input_path compressed/opt125m_4_8 \
+    --output_path recovered/opt125m_4_8 \
+    --pattern 4:8 \
+    --dtype float16
+```
+
+Arguments:
+
+```text
+--input_path    Path to compressed ISDC bitstreams.
+--output_path   Path to save reconstructed sparse weights.
+--pattern       N:M sparsity pattern used during compression.
+--dtype         Data type of reconstructed weights.
+```
+
+---
+
+## 4. Verify Exact Reconstruction
+
+To verify that decompression is lossless, run:
+
+```bash
+python benchmark/verify_reconstruction.py \
+    --original_path data/opt125m_4_8 \
+    --recovered_path recovered/opt125m_4_8
+```
+
+Expected output:
+
+```text
+All weights are exactly reconstructed.
+Maximum absolute error: 0.0
+```
+
+---
+
+## 5. Run Compression Ratio Evaluation
+
+To evaluate compression ratio, run:
+
+```bash
+python benchmark/compression_ratio.py \
+    --input_path data/opt125m_4_8 \
+    --compressed_path compressed/opt125m_4_8 \
+    --pattern 4:8 \
+    --dtype float16
+```
+
+The script reports:
+
+```text
+Original size
+Compressed size
+Compression ratio
+Metadata overhead
+```
+
+---
+
+## 6. Run GPU Decompression Benchmark
+
+To benchmark GPU-side decompression latency, first compile the CUDA kernels:
+
+```bash
+cd cuda
+mkdir -p build
+cd build
+cmake ..
+make -j
+```
+
+Then run:
+
+```bash
+python benchmark/decompression_speed.py \
+    --compressed_path compressed/opt125m_4_8 \
+    --pattern 4:8 \
+    --dtype float16
+```
+
+The script reports:
+
+```text
+Average decompression latency
+Throughput
+GPU memory usage
+```
+
+---
+
+## 7. Reproduce Main Experiments
+
+Example scripts are provided in the `examples/` directory.
+
+For OPT-125M:
+
+```bash
+python examples/opt125m.py \
+    --pattern 4:8 \
+    --dtype float16
+```
+
+For OPT-350M:
+
+```bash
+python examples/opt350m.py \
+    --pattern 4:8 \
+    --dtype float16
+```
+
+For OPT-1.3B:
+
+```bash
+python examples/opt1.3b.py \
+    --pattern 4:8 \
+    --dtype float16
+```
+
+---
+
+## Notes
+
+* ISDC is a lossless compression method. The decompressed weights should be exactly identical to the original sparse weights.
+* Larger N:M group sizes usually provide better compression ratios but may introduce higher decompression overhead.
+* The current implementation focuses on sparse weight compression and GPU-side reconstruction.
