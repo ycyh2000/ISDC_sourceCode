@@ -137,7 +137,6 @@ Expected output:
 * Ubuntu 22.04 / 24.04
 * Python >= 3.10
 * CUDA >= 11.8
-* NVIDIA GPU (recommended)
 
 The experiments in the paper were conducted on:
 
