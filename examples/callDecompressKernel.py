@@ -14,7 +14,13 @@ libdecompress_2048_2048 = ctypes.CDLL("../cuda/endToEnd/libdecompress_2048_2048.
 libdecompress_2048_8192 = ctypes.CDLL("../cuda/endToEnd/libdecompress_2048_8192.so")
 libdecompress_8192_2048 = ctypes.CDLL("../cuda/endToEnd/libdecompress_8192_2048.so")
 
-# libdecompress_768_768 = ctypes.CDLL("./kernel/libdecompress_768_768.so")
+# libdecompress_768_768 = ctypes.CDLL("./kernel/libdecompress_768_768.
+#
+#
+# `
+#
+#
+# so")
 # libdecompress_768_3072 = ctypes.CDLL("./kernel/libdecompress_768_3072.so")
 # libdecompress_3072_768 = ctypes.CDLL("./kernel/libdecompress_3072_768.so")
 #
