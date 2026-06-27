@@ -1,1 +1,8 @@
 路径
+*.bin
+*.h5
+*.msgpack
+*.safetensors
+examples/facebook__opt-125m/
+examples/facebook__opt-350m/
+examples/result/
